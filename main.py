@@ -660,6 +660,9 @@ def monitor(config: Config, source: TweetSource, run_once: bool = False) -> None
             break
         except Exception:
             LOGGER.exception("Temporary monitoring failure")
+            if run_once:
+                LOGGER.info("--once was provided, so exiting after the failed polling attempt.")
+                break
             sleep_for = min(backoff_seconds, config.max_backoff_seconds)
             LOGGER.info("Retrying in %ss", sleep_for)
             time.sleep(sleep_for)
