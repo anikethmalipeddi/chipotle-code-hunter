@@ -6,6 +6,7 @@ draft, and copies the detected code. It does not send texts or redeem anything.
 """
 
 import argparse
+from contextlib import redirect_stderr, redirect_stdout
 import hashlib
 import json
 import logging
@@ -17,7 +18,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 from urllib.parse import quote
 
 
@@ -34,15 +35,20 @@ COMMON_NON_CODES = {
     "AVAILABLE",
     "BASKETBALL",
     "BEFORE",
+    "BOWLS",
     "BURRITO",
+    "BURRITOS",
     "CHIPOTLE",
     "CLAIM",
     "CINCO",
     "CODE",
+    "COMING",
     "COMEBACK",
     "COMMENT",
     "DINNER",
+    "DROPS",
     "ENTREE",
+    "ENTREES",
     "FINAL",
     "FINALS",
     "FOLLOW",
@@ -60,15 +66,21 @@ COMMON_NON_CODES = {
     "ORDER",
     "PLAYOFFS",
     "PROMO",
+    "REDEEM",
     "REPLY",
     "RESTAURANT",
+    "RESTAURANTS",
     "REWARD",
     "REWARDS",
+    "SOON",
+    "STARTING",
+    "STARTS",
     "SUPER",
     "SWEEPSTAKES",
     "THANKS",
     "TODAY",
     "TONIGHT",
+    "TOMORROW",
     "TWEET",
     "TWEETS",
     "WHILE",
@@ -163,6 +175,10 @@ class DetectionResult:
     candidate: Optional[CodeCandidate]
 
 
+class TemporaryFetchError(RuntimeError):
+    """Raised when the tweet source has a retryable fetch problem."""
+
+
 class TweetSource(Protocol):
     def fetch_latest(self, username: str, count: int) -> List[Tweet]:
         """Return recent tweets for username, newest first."""
@@ -183,18 +199,40 @@ class NitterTweetSource:
                 "Missing dependency: install requirements with `pip install -r requirements.txt`."
             ) from exc
 
-        self._scraper = Nitter(log_level=log_level, skip_instance_check=False)
+        root_logger = logging.getLogger()
+        previous_log_level = root_logger.level
         self._instance = nitter_instance
+        instances = [nitter_instance] if nitter_instance else None
+        if log_level == 0:
+            with open(os.devnull, "w", encoding="utf-8") as devnull:
+                with redirect_stdout(devnull), redirect_stderr(devnull):
+                    self._scraper = Nitter(
+                        instances=instances,
+                        log_level=log_level,
+                        skip_instance_check=bool(nitter_instance),
+                    )
+        else:
+            self._scraper = Nitter(
+                instances=instances,
+                log_level=log_level,
+                skip_instance_check=bool(nitter_instance),
+            )
+        root_logger.setLevel(previous_log_level)
 
     def fetch_latest(self, username: str, count: int) -> List[Tweet]:
         LOGGER.debug("Fetching %s latest tweets for @%s", count, username)
-        response = self._scraper.get_tweets(
-            username,
-            mode="user",
-            number=count,
-            instance=self._instance,
-            max_retries=2,
-        )
+        try:
+            response = self._scraper.get_tweets(
+                username,
+                mode="user",
+                number=count,
+                instance=self._instance,
+                max_retries=2,
+            )
+        except Exception as exc:
+            raise TemporaryFetchError(
+                f"Could not fetch tweets from Nitter/ntscraper ({type(exc).__name__}: {exc})"
+            ) from exc
 
         if not isinstance(response, dict):
             LOGGER.warning("Unexpected ntscraper response type: %s", type(response).__name__)
@@ -420,7 +458,7 @@ def extract_best_code(text: str, sms_number: str) -> Optional[CodeCandidate]:
     contextual_patterns = [
         r"\bTEXT(?:\s+US)?\s+(?:THE\s+)?(?:CODE\s+)?([A-Z0-9]{5,20})\s+TO\b",
         r"\b(?:SEND|MESSAGE|REPLY)\s+(?:THE\s+)?(?:CODE\s+)?([A-Z0-9]{5,20})\b",
-        r"\b(?:KEYWORD|CODE|PROMO\s+CODE|CLAIM\s+CODE)\s*(?:IS|=|:)?\s*([A-Z0-9]{5,20})\b",
+        r"\b(?:KEYWORD|CODE|PROMO\s+CODE|CLAIM\s+CODE)\s*(?:IS|=|:)\s*([A-Z0-9]{5,20})\b",
     ]
 
     if sms_digits:
@@ -447,9 +485,18 @@ def extract_best_code(text: str, sms_number: str) -> Optional[CodeCandidate]:
 
         context = uppercase_text[max(0, match.start() - 50) : match.end() + 50]
         context_score = 0.0
-        if re.search(r"\b(TEXT|SEND|MESSAGE|REPLY|KEYWORD|CODE)\b", context):
+        has_action_context = bool(re.search(r"\b(TEXT|SEND|MESSAGE|REPLY|KEYWORD)\b", context))
+        has_code_context = bool(re.search(r"\b(CODE|PROMO\s+CODE|CLAIM\s+CODE)\b", context))
+        has_sms_context = bool(sms_digits and sms_digits in normalize_digits(context))
+
+        if not (has_action_context or has_code_context or has_sms_context):
+            continue
+        if raw_code.isalpha() and not (has_action_context or has_sms_context):
+            continue
+
+        if has_action_context or has_code_context:
             context_score += 3.0
-        if sms_digits and sms_digits in normalize_digits(context):
+        if has_sms_context:
             context_score += 2.0
         if re.search(r"\b(FREE|CLAIM|GIVEAWAY|DROP|ENTREE|BURRITO|BOWL)\b", context):
             context_score += 1.5
@@ -630,7 +677,7 @@ def trim_for_log(text: str, max_length: int = 120) -> str:
     return clean[: max_length - 3] + "..."
 
 
-def monitor(config: Config, source: TweetSource, run_once: bool = False) -> None:
+def monitor(config: Config, source: TweetSource, run_once: bool = False) -> bool:
     seen_store = SeenStore(config.state_file)
     seen_store.load()
 
@@ -651,18 +698,28 @@ def monitor(config: Config, source: TweetSource, run_once: bool = False) -> None
             backoff_seconds = config.poll_interval_seconds
 
             if run_once:
-                break
+                return True
 
             time.sleep(config.poll_interval_seconds)
         except KeyboardInterrupt:
             LOGGER.info("Shutdown requested. Saving state and exiting.")
             seen_store.save()
-            break
+            return True
+        except TemporaryFetchError as exc:
+            LOGGER.warning("%s", exc)
+            LOGGER.debug("Fetch failure details", exc_info=True)
+            if run_once:
+                LOGGER.info("--once was provided, so exiting after the failed polling attempt.")
+                return False
+            sleep_for = min(backoff_seconds, config.max_backoff_seconds)
+            LOGGER.info("Retrying in %ss", sleep_for)
+            time.sleep(sleep_for)
+            backoff_seconds = min(backoff_seconds * 2, config.max_backoff_seconds)
         except Exception:
             LOGGER.exception("Temporary monitoring failure")
             if run_once:
                 LOGGER.info("--once was provided, so exiting after the failed polling attempt.")
-                break
+                return False
             sleep_for = min(backoff_seconds, config.max_backoff_seconds)
             LOGGER.info("Retrying in %ss", sleep_for)
             time.sleep(sleep_for)
@@ -739,8 +796,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         LOGGER.error("%s", exc)
         return 1
 
-    monitor(config, source, run_once=args.once)
-    return 0
+    return 0 if monitor(config, source, run_once=args.once) else 1
 
 
 def print_config(config: Config) -> None:

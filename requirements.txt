@@ -1,1 +1,2 @@
 ntscraper==0.4.0
+urllib3<2
