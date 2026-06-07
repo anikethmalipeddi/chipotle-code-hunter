@@ -16,7 +16,7 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 from urllib.parse import quote
@@ -106,6 +106,7 @@ class Config:
     fetch_count: int
     detection_threshold: float
     auto_open_messages: bool
+    auto_send_messages: bool
     copy_code_to_clipboard: bool
     play_sound: bool
     alert_sound: str
@@ -128,6 +129,7 @@ class Config:
             fetch_count=get_int_env("FETCH_COUNT", 5, minimum=1),
             detection_threshold=get_float_env("DETECTION_THRESHOLD", 6.0, minimum=1.0),
             auto_open_messages=get_bool_env("AUTO_OPEN_MESSAGES", True),
+            auto_send_messages=get_bool_env("AUTO_SEND_MESSAGES", False),
             copy_code_to_clipboard=get_bool_env("COPY_CODE_TO_CLIPBOARD", True),
             play_sound=get_bool_env("PLAY_SOUND", True),
             alert_sound=get_env("ALERT_SOUND", "/System/Library/Sounds/Sosumi.aiff"),
@@ -632,6 +634,10 @@ def open_messages(config: Config, code: str) -> None:
     if config.copy_code_to_clipboard:
         copy_to_clipboard(code, config.dry_run)
 
+    if config.auto_send_messages:
+        send_message(config, code)
+        return
+
     if not config.auto_open_messages:
         LOGGER.info("AUTO_OPEN_MESSAGES=false: not opening Messages")
         return
@@ -650,6 +656,54 @@ def open_messages(config: Config, code: str) -> None:
         subprocess.run(["open", sms_url], check=False)
     except OSError as exc:
         LOGGER.warning("Could not open Messages: %s", exc)
+
+
+def send_message(config: Config, code: str) -> None:
+    if config.dry_run:
+        LOGGER.info("DRY_RUN=true: would send %s to %s in Messages", code, config.sms_number)
+        return
+    if platform.system() != "Darwin":
+        LOGGER.warning("Auto-send is macOS-only. Copy the code manually: %s", code)
+        return
+
+    script = """
+    on run argv
+        set targetNumber to item 1 of argv
+        set promoCode to item 2 of argv
+
+        tell application "Messages"
+            activate
+            set smsService to first service whose service type = SMS
+            set targetBuddy to buddy targetNumber of smsService
+            send promoCode to targetBuddy
+        end tell
+    end run
+    """
+
+    try:
+        completed = subprocess.run(
+            ["osascript", "-e", script, config.sms_number, code],
+            check=False,
+            timeout=15,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        LOGGER.warning("Could not auto-send Messages text: %s", exc)
+        return
+
+    if completed.returncode == 0:
+        LOGGER.info("Sent %s to %s through Messages", code, config.sms_number)
+    else:
+        LOGGER.warning(
+            "Messages auto-send failed. macOS may need automation permissions or SMS forwarding. Error: %s",
+            completed.stderr.strip() or "unknown error",
+        )
+        if config.auto_open_messages:
+            LOGGER.info("Falling back to opening Messages with the code prefilled")
+            fallback_config = replace(config, auto_send_messages=False, copy_code_to_clipboard=False)
+            open_messages(fallback_config, code)
 
 
 def copy_to_clipboard(text: str, dry_run: bool) -> None:
@@ -807,6 +861,7 @@ def print_config(config: Config) -> None:
         "fetch_count": config.fetch_count,
         "detection_threshold": config.detection_threshold,
         "auto_open_messages": config.auto_open_messages,
+        "auto_send_messages": config.auto_send_messages,
         "copy_code_to_clipboard": config.copy_code_to_clipboard,
         "play_sound": config.play_sound,
         "alert_sound": config.alert_sound,

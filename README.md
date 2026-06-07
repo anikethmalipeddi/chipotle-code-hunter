@@ -2,9 +2,9 @@
 
 I got tired of watching Twitter every time Chipotle did one of those free entree text-code drops, so I made this.
 
-This is a small Python script that watches `@ChipotleTweets`. If a tweet looks like a text-to-claim promo, it tries to pull out the code, makes noise, prints the tweet, copies the code, and opens Messages so you can send it yourself.
+This is a small Python script that watches `@ChipotleTweets`. If a tweet looks like a text-to-claim promo, it tries to pull out the code, makes noise, prints the tweet, copies the code, and opens Messages.
 
-It does **not** auto-send texts or redeem anything.
+By default it does not send the text. If you want it to send through Messages automatically on macOS, set `AUTO_SEND_MESSAGES=true` in `.env`.
 
 ## What it does
 
@@ -15,6 +15,7 @@ It does **not** auto-send texts or redeem anything.
 - Plays a loud alert
 - Prints the tweet and code in the terminal
 - Opens macOS Messages to `888222`
+- Can auto-send through Messages if you turn that on
 - Copies the code to your clipboard
 - Remembers tweets it already checked so it does not keep alerting on the same thing
 
@@ -84,6 +85,7 @@ These go in `.env`.
 | `FETCH_COUNT` | `5` | How many recent tweets to look at. |
 | `DETECTION_THRESHOLD` | `6` | Higher = fewer alerts, lower = more alerts. |
 | `AUTO_OPEN_MESSAGES` | `true` | Opens Messages when a code is found. |
+| `AUTO_SEND_MESSAGES` | `false` | Sends the code through macOS Messages automatically. Requires Messages/SMS forwarding and macOS automation permission. |
 | `COPY_CODE_TO_CLIPBOARD` | `true` | Copies the code after detection. |
 | `PLAY_SOUND` | `true` | Plays the alert sound. |
 | `ALERT_SOUND` | `/System/Library/Sounds/Sosumi.aiff` | Sound file for the alert. |
@@ -115,11 +117,13 @@ Scraping Twitter/X is annoying and can break. If all the public Nitter instances
 
 Also, the Messages prefill is best-effort. The script opens the `sms:` link and also copies the code because macOS does not always prefill the message body reliably.
 
+If `AUTO_SEND_MESSAGES=true`, the script uses AppleScript to send through the macOS Messages app. You may need to let Terminal/iTerm/Python control Messages in System Settings. Your Mac also has to be able to send SMS messages through Messages.
+
 ## Disclaimer
 
 This is just a personal helper script. You are responsible for following Chipotle, X, carrier, and promo rules.
 
-No texts are sent automatically. No promos are redeemed automatically. This project is not affiliated with Chipotle or X.
+Automatic sending is off by default. If you enable it, that is on you. This project is not affiliated with Chipotle or X.
 
 ## Contributing
 
