@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Monitor Chipotle tweets for likely text-to-claim promo code drops.
 
-This tool is intentionally manual-assist only: it alerts, opens a Messages
-draft, and copies the detected code. It does not send texts or redeem anything.
+By default this tool is manual-assist only: it alerts, opens a Messages draft,
+and copies the detected code. If AUTO_SEND_MESSAGES=true is set, it can also
+send through the macOS Messages app.
 """
 
 import argparse
@@ -20,6 +21,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 from urllib.parse import quote
+
+import requests
 
 
 LOGGER = logging.getLogger("chipotle_code_hunter")
@@ -102,6 +105,8 @@ PROMO_SIGNALS: Sequence[Tuple[re.Pattern[str], float, str]] = (
 class Config:
     target_username: str
     sms_number: str
+    monitor_backend: str
+    x_bearer_token: Optional[str]
     poll_interval_seconds: int
     fetch_count: int
     detection_threshold: float
@@ -125,6 +130,8 @@ class Config:
         return cls(
             target_username=get_env("TARGET_USERNAME", "ChipotleTweets").lstrip("@"),
             sms_number=get_env("SMS_NUMBER", "888222"),
+            monitor_backend=get_env("MONITOR_BACKEND", "auto").lower(),
+            x_bearer_token=blank_to_none(get_env("X_BEARER_TOKEN", "")),
             poll_interval_seconds=get_int_env("POLL_INTERVAL_SECONDS", 30, minimum=5),
             fetch_count=get_int_env("FETCH_COUNT", 5, minimum=1),
             detection_threshold=get_float_env("DETECTION_THRESHOLD", 6.0, minimum=1.0),
@@ -253,6 +260,102 @@ class NitterTweetSource:
                     tweets.append(tweet)
 
         return tweets
+
+
+class XApiTweetSource:
+    """TweetSource backed by the official X API v2."""
+
+    def __init__(
+        self,
+        bearer_token: str,
+        base_url: str = "https://api.x.com/2",
+        session: Optional[requests.Session] = None,
+        timeout_seconds: int = 15,
+    ) -> None:
+        self._bearer_token = bearer_token
+        self._base_url = base_url.rstrip("/")
+        self._session = session or requests.Session()
+        self._timeout_seconds = timeout_seconds
+        self._user_id_cache: Dict[str, str] = {}
+
+    def fetch_latest(self, username: str, count: int) -> List[Tweet]:
+        user_id = self._get_user_id(username)
+        max_results = max(5, min(count, 100))
+        payload = self._request_json(
+            f"/users/{user_id}/tweets",
+            {
+                "max_results": str(max_results),
+                "tweet.fields": "created_at",
+                "exclude": "retweets",
+            },
+        )
+
+        raw_tweets = payload.get("data") or []
+        if not isinstance(raw_tweets, list):
+            raise TemporaryFetchError("X API returned an unexpected tweets payload")
+
+        tweets: List[Tweet] = []
+        for raw in raw_tweets[:count]:
+            if not isinstance(raw, dict):
+                continue
+            tweet_id = str(raw.get("id") or "").strip()
+            text = str(raw.get("text") or "").strip()
+            if not tweet_id or not text:
+                continue
+            tweets.append(
+                Tweet(
+                    id=tweet_id,
+                    text=text,
+                    url=f"https://x.com/{username}/status/{tweet_id}",
+                    created_at=str(raw.get("created_at") or "").strip() or None,
+                    raw=raw,
+                )
+            )
+        return tweets
+
+    def _get_user_id(self, username: str) -> str:
+        cache_key = username.lower()
+        if cache_key in self._user_id_cache:
+            return self._user_id_cache[cache_key]
+
+        payload = self._request_json(f"/users/by/username/{username}", {})
+        data = payload.get("data")
+        if not isinstance(data, dict) or not data.get("id"):
+            raise TemporaryFetchError(f"X API could not resolve @{username}")
+
+        user_id = str(data["id"])
+        self._user_id_cache[cache_key] = user_id
+        return user_id
+
+    def _request_json(self, path: str, params: Dict[str, str]) -> Dict[str, Any]:
+        url = self._base_url + path
+        headers = {"Authorization": f"Bearer {self._bearer_token}"}
+
+        try:
+            response = self._session.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=self._timeout_seconds,
+            )
+        except requests.RequestException as exc:
+            raise TemporaryFetchError(f"X API request failed: {exc}") from exc
+
+        if response.status_code >= 400:
+            raise TemporaryFetchError(
+                f"X API returned HTTP {response.status_code}: {response.text[:200]}"
+            )
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise TemporaryFetchError("X API returned invalid JSON") from exc
+
+        if not isinstance(payload, dict):
+            raise TemporaryFetchError("X API returned an unexpected response shape")
+        if payload.get("errors") and not payload.get("data"):
+            raise TemporaryFetchError(f"X API returned errors: {payload['errors']}")
+        return payload
 
 
 class SeenStore:
@@ -780,6 +883,22 @@ def monitor(config: Config, source: TweetSource, run_once: bool = False) -> bool
             backoff_seconds = min(backoff_seconds * 2, config.max_backoff_seconds)
 
 
+def build_tweet_source(config: Config) -> TweetSource:
+    backend = config.monitor_backend
+    if backend not in {"auto", "nitter", "x_api"}:
+        raise RuntimeError("MONITOR_BACKEND must be one of: auto, nitter, x_api")
+
+    if backend in {"auto", "x_api"} and config.x_bearer_token:
+        LOGGER.info("Using official X API backend")
+        return XApiTweetSource(config.x_bearer_token)
+
+    if backend == "x_api":
+        raise RuntimeError("MONITOR_BACKEND=x_api requires X_BEARER_TOKEN")
+
+    LOGGER.info("Using ntscraper/Nitter backend")
+    return NitterTweetSource(config.nitter_instance, config.ntscraper_log_level)
+
+
 def run_detection_self_test(config: Config) -> int:
     cases = [
         ("Text DUNK23 to 888222 for a free entree", True, "DUNK23"),
@@ -822,6 +941,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print the resolved configuration and exit.",
     )
+    parser.add_argument(
+        "--test-message",
+        metavar="CODE",
+        help="Test the Messages action for CODE without fetching tweets. Honors DRY_RUN and AUTO_SEND_MESSAGES.",
+    )
     return parser
 
 
@@ -844,8 +968,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.test_detection:
         return 1 if run_detection_self_test(config) else 0
 
+    if args.test_message:
+        code = args.test_message.strip().upper()
+        if not code:
+            print("--test-message requires a non-empty code", file=sys.stderr)
+            return 2
+        open_messages(config, code)
+        return 0
+
     try:
-        source = NitterTweetSource(config.nitter_instance, config.ntscraper_log_level)
+        source = build_tweet_source(config)
     except RuntimeError as exc:
         LOGGER.error("%s", exc)
         return 1
@@ -857,6 +989,8 @@ def print_config(config: Config) -> None:
     redacted = {
         "target_username": config.target_username,
         "sms_number": config.sms_number,
+        "monitor_backend": config.monitor_backend,
+        "x_bearer_token_configured": bool(config.x_bearer_token),
         "poll_interval_seconds": config.poll_interval_seconds,
         "fetch_count": config.fetch_count,
         "detection_threshold": config.detection_threshold,

@@ -19,11 +19,28 @@ By default it does not send the text. If you want it to send through Messages au
 - Copies the code to your clipboard
 - Remembers tweets it already checked so it does not keep alerting on the same thing
 
-## Why it uses a scraper
+## Monitoring backend
 
-I would rather use the official X API, but it is not really practical for a tiny personal project because X charges for API reads now.
+Best setup: use the official X API if you have a bearer token.
 
-So this version uses [`ntscraper`](https://pypi.org/project/ntscraper/). That means it depends on public Nitter instances, which can be flaky. The code is set up so the tweet source can be swapped later if someone wants to add an official X API version.
+```env
+MONITOR_BACKEND=auto
+X_BEARER_TOKEN=your_token_here
+```
+
+If you do not set `X_BEARER_TOKEN`, it falls back to [`ntscraper`](https://pypi.org/project/ntscraper/). That works without an API key, but it depends on public Nitter instances, which can be flaky.
+
+You can force either one:
+
+```env
+MONITOR_BACKEND=x_api
+```
+
+or:
+
+```env
+MONITOR_BACKEND=nitter
+```
 
 ## Setup
 
@@ -73,6 +90,18 @@ Safe dry run:
 DRY_RUN=true AUTO_OPEN_MESSAGES=false PLAY_SOUND=false python3 main.py --once
 ```
 
+Test the Messages/send path without fetching tweets:
+
+```bash
+DRY_RUN=true AUTO_SEND_MESSAGES=true python3 main.py --test-message DUNK23
+```
+
+Actually enable auto-send:
+
+```env
+AUTO_SEND_MESSAGES=true
+```
+
 ## Config
 
 These go in `.env`.
@@ -81,6 +110,8 @@ These go in `.env`.
 | --- | --- | --- |
 | `TARGET_USERNAME` | `ChipotleTweets` | Account to watch, without `@`. |
 | `SMS_NUMBER` | `888222` | Text-to-claim number. |
+| `MONITOR_BACKEND` | `auto` | `auto`, `x_api`, or `nitter`. |
+| `X_BEARER_TOKEN` | empty | Official X API bearer token. Used when set. |
 | `POLL_INTERVAL_SECONDS` | `30` | How often to check. |
 | `FETCH_COUNT` | `5` | How many recent tweets to look at. |
 | `DETECTION_THRESHOLD` | `6` | Higher = fewer alerts, lower = more alerts. |
@@ -113,11 +144,19 @@ Text DUNK23 to 888222 for a free entree while supplies last.
 
 ## Notes
 
-Scraping Twitter/X is annoying and can break. If all the public Nitter instances are down, the live check will fail until a working instance is available.
+The official X API is the reliable option if you have access to it. The no-key scraper fallback can break if X changes things or if public Nitter instances are down.
 
 Also, the Messages prefill is best-effort. The script opens the `sms:` link and also copies the code because macOS does not always prefill the message body reliably.
 
 If `AUTO_SEND_MESSAGES=true`, the script uses AppleScript to send through the macOS Messages app. You may need to let Terminal/iTerm/Python control Messages in System Settings. Your Mac also has to be able to send SMS messages through Messages.
+
+To test that setup without sending anything, keep `DRY_RUN=true` and run:
+
+```bash
+DRY_RUN=true AUTO_SEND_MESSAGES=true python3 main.py --test-message DUNK23
+```
+
+Once that looks right, set `DRY_RUN=false` in `.env` for the real thing.
 
 ## Disclaimer
 
