@@ -910,7 +910,9 @@ def monitor(config: Config, source: TweetSource, run_once: bool = False) -> bool
                 return False
             sleep_for = min(backoff_seconds, config.max_backoff_seconds)
             LOGGER.info("Retrying in %ss", sleep_for)
-            time.sleep(sleep_for)
+            if not sleep_between_polls(sleep_for):
+                seen_store.save()
+                return True
             backoff_seconds = min(backoff_seconds * 2, config.max_backoff_seconds)
         except Exception:
             LOGGER.exception("Temporary monitoring failure")
@@ -919,8 +921,19 @@ def monitor(config: Config, source: TweetSource, run_once: bool = False) -> bool
                 return False
             sleep_for = min(backoff_seconds, config.max_backoff_seconds)
             LOGGER.info("Retrying in %ss", sleep_for)
-            time.sleep(sleep_for)
+            if not sleep_between_polls(sleep_for):
+                seen_store.save()
+                return True
             backoff_seconds = min(backoff_seconds * 2, config.max_backoff_seconds)
+
+
+def sleep_between_polls(seconds: float) -> bool:
+    try:
+        time.sleep(seconds)
+        return True
+    except KeyboardInterrupt:
+        LOGGER.info("Shutdown requested. Exiting.")
+        return False
 
 
 def build_tweet_source(config: Config) -> TweetSource:
