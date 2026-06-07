@@ -14,15 +14,15 @@ import logging
 import os
 import platform
 import re
-import subprocess
+import subprocess  # nosec B404
 import sys
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
-from urllib.parse import quote
-
-import requests
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode
+from urllib.request import Request, urlopen
 
 
 LOGGER = logging.getLogger("chipotle_code_hunter")
@@ -30,6 +30,11 @@ LOGGER = logging.getLogger("chipotle_code_hunter")
 URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 TWEET_ID_RE = re.compile(r"/status(?:es)?/(\d+)")
 TOKEN_RE = re.compile(r"\b[A-Z0-9]{5,20}\b")
+
+AFPLAY_COMMAND = "/usr/bin/afplay"
+OPEN_COMMAND = "/usr/bin/open"
+OSASCRIPT_COMMAND = "/usr/bin/osascript"
+PBCOPY_COMMAND = "/usr/bin/pbcopy"
 
 
 COMMON_NON_CODES = {
@@ -107,6 +112,7 @@ class Config:
     sms_number: str
     monitor_backend: str
     x_bearer_token: Optional[str]
+    request_min_interval_seconds: float
     poll_interval_seconds: int
     fetch_count: int
     detection_threshold: float
@@ -132,6 +138,7 @@ class Config:
             sms_number=get_env("SMS_NUMBER", "888222"),
             monitor_backend=get_env("MONITOR_BACKEND", "auto").lower(),
             x_bearer_token=blank_to_none(get_env("X_BEARER_TOKEN", "")),
+            request_min_interval_seconds=get_float_env("REQUEST_MIN_INTERVAL_SECONDS", 2.0, minimum=0.0),
             poll_interval_seconds=get_int_env("POLL_INTERVAL_SECONDS", 30, minimum=5),
             fetch_count=get_int_env("FETCH_COUNT", 5, minimum=1),
             detection_threshold=get_float_env("DETECTION_THRESHOLD", 6.0, minimum=1.0),
@@ -193,6 +200,25 @@ class TweetSource(Protocol):
         """Return recent tweets for username, newest first."""
 
 
+class RateLimiter:
+    """Small single-process limiter for outbound source requests."""
+
+    def __init__(self, min_interval_seconds: float) -> None:
+        self.min_interval_seconds = max(0.0, min_interval_seconds)
+        self._last_request_at = 0.0
+
+    def wait(self, endpoint_name: str) -> None:
+        if self.min_interval_seconds <= 0:
+            return
+
+        now = time.monotonic()
+        wait_for = self.min_interval_seconds - (now - self._last_request_at)
+        if wait_for > 0:
+            LOGGER.debug("Rate limiting %s for %.2fs", endpoint_name, wait_for)
+            time.sleep(wait_for)
+        self._last_request_at = time.monotonic()
+
+
 class NitterTweetSource:
     """TweetSource backed by ntscraper.
 
@@ -200,7 +226,12 @@ class NitterTweetSource:
     temporary and retry with backoff.
     """
 
-    def __init__(self, nitter_instance: Optional[str], log_level: Optional[int]) -> None:
+    def __init__(
+        self,
+        nitter_instance: Optional[str],
+        log_level: Optional[int],
+        rate_limiter: RateLimiter,
+    ) -> None:
         try:
             from ntscraper import Nitter
         except ImportError as exc:
@@ -211,6 +242,7 @@ class NitterTweetSource:
         root_logger = logging.getLogger()
         previous_log_level = root_logger.level
         self._instance = nitter_instance
+        self._rate_limiter = rate_limiter
         instances = [nitter_instance] if nitter_instance else None
         if log_level == 0:
             with open(os.devnull, "w", encoding="utf-8") as devnull:
@@ -230,6 +262,7 @@ class NitterTweetSource:
 
     def fetch_latest(self, username: str, count: int) -> List[Tweet]:
         LOGGER.debug("Fetching %s latest tweets for @%s", count, username)
+        self._rate_limiter.wait("nitter.get_tweets")
         try:
             response = self._scraper.get_tweets(
                 username,
@@ -268,15 +301,17 @@ class XApiTweetSource:
     def __init__(
         self,
         bearer_token: str,
+        rate_limiter: RateLimiter,
         base_url: str = "https://api.x.com/2",
-        session: Optional[requests.Session] = None,
+        opener: Optional[Any] = None,
         timeout_seconds: int = 15,
     ) -> None:
         self._bearer_token = bearer_token
         self._base_url = base_url.rstrip("/")
-        self._session = session or requests.Session()
+        self._opener = opener or urlopen
         self._timeout_seconds = timeout_seconds
         self._user_id_cache: Dict[str, str] = {}
+        self._rate_limiter = rate_limiter
 
     def fetch_latest(self, username: str, count: int) -> List[Tweet]:
         user_id = self._get_user_id(username)
@@ -328,27 +363,32 @@ class XApiTweetSource:
         return user_id
 
     def _request_json(self, path: str, params: Dict[str, str]) -> Dict[str, Any]:
-        url = self._base_url + path
+        query = f"?{urlencode(params)}" if params else ""
+        url = self._base_url + path + query
         headers = {"Authorization": f"Bearer {self._bearer_token}"}
+        self._rate_limiter.wait(f"x_api{path}")
+        request = Request(url, headers=headers, method="GET")
 
         try:
-            response = self._session.get(
-                url,
-                headers=headers,
-                params=params,
-                timeout=self._timeout_seconds,
-            )
-        except requests.RequestException as exc:
+            response = self._opener(request, timeout=self._timeout_seconds)
+            body = response.read().decode("utf-8")
+            status_code = getattr(response, "status", 200)
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise TemporaryFetchError(
+                f"X API returned HTTP {exc.code}: {body[:200]}"
+            ) from exc
+        except URLError as exc:
             raise TemporaryFetchError(f"X API request failed: {exc}") from exc
 
-        if response.status_code >= 400:
+        if status_code >= 400:
             raise TemporaryFetchError(
-                f"X API returned HTTP {response.status_code}: {response.text[:200]}"
+                f"X API returned HTTP {status_code}: {body[:200]}"
             )
 
         try:
-            payload = response.json()
-        except ValueError as exc:
+            payload = json.loads(body)
+        except json.JSONDecodeError as exc:
             raise TemporaryFetchError("X API returned invalid JSON") from exc
 
         if not isinstance(payload, dict):
@@ -721,8 +761,8 @@ def alert_user(config: Config, code: str) -> None:
 
     for index in range(config.alert_repeat_count):
         try:
-            subprocess.run(
-                ["afplay", str(sound_path)],
+            subprocess.run(  # nosec B603
+                [AFPLAY_COMMAND, str(sound_path)],
                 check=False,
                 timeout=10,
                 stdout=subprocess.DEVNULL,
@@ -756,7 +796,7 @@ def open_messages(config: Config, code: str) -> None:
     sms_url = f"sms:{recipient}&body={body}"
 
     try:
-        subprocess.run(["open", sms_url], check=False)
+        subprocess.run([OPEN_COMMAND, sms_url], check=False)  # nosec B603
     except OSError as exc:
         LOGGER.warning("Could not open Messages: %s", exc)
 
@@ -784,8 +824,8 @@ def send_message(config: Config, code: str) -> None:
     """
 
     try:
-        completed = subprocess.run(
-            ["osascript", "-e", script, config.sms_number, code],
+        completed = subprocess.run(  # nosec B603
+            [OSASCRIPT_COMMAND, "-e", script, config.sms_number, code],
             check=False,
             timeout=15,
             stdout=subprocess.DEVNULL,
@@ -815,8 +855,8 @@ def copy_to_clipboard(text: str, dry_run: bool) -> None:
         return
 
     try:
-        subprocess.run(
-            ["pbcopy"],
+        subprocess.run(  # nosec B603
+            [PBCOPY_COMMAND],
             input=text.encode("utf-8"),
             check=False,
             stdout=subprocess.DEVNULL,
@@ -888,15 +928,17 @@ def build_tweet_source(config: Config) -> TweetSource:
     if backend not in {"auto", "nitter", "x_api"}:
         raise RuntimeError("MONITOR_BACKEND must be one of: auto, nitter, x_api")
 
+    rate_limiter = RateLimiter(config.request_min_interval_seconds)
+
     if backend in {"auto", "x_api"} and config.x_bearer_token:
         LOGGER.info("Using official X API backend")
-        return XApiTweetSource(config.x_bearer_token)
+        return XApiTweetSource(config.x_bearer_token, rate_limiter=rate_limiter)
 
     if backend == "x_api":
         raise RuntimeError("MONITOR_BACKEND=x_api requires X_BEARER_TOKEN")
 
     LOGGER.info("Using ntscraper/Nitter backend")
-    return NitterTweetSource(config.nitter_instance, config.ntscraper_log_level)
+    return NitterTweetSource(config.nitter_instance, config.ntscraper_log_level, rate_limiter)
 
 
 def run_detection_self_test(config: Config) -> int:
@@ -991,6 +1033,7 @@ def print_config(config: Config) -> None:
         "sms_number": config.sms_number,
         "monitor_backend": config.monitor_backend,
         "x_bearer_token_configured": bool(config.x_bearer_token),
+        "request_min_interval_seconds": config.request_min_interval_seconds,
         "poll_interval_seconds": config.poll_interval_seconds,
         "fetch_count": config.fetch_count,
         "detection_threshold": config.detection_threshold,

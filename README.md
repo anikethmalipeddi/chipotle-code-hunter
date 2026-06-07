@@ -1,48 +1,25 @@
 # chipotle-code-hunter
 
-I got tired of watching Twitter every time Chipotle did one of those free entree text-code drops, so I made this.
+I made this because I got tired of watching Twitter for Chipotle free entree text-code drops.
 
-This is a small Python script that watches `@ChipotleTweets`. If a tweet looks like a text-to-claim promo, it tries to pull out the code, makes noise, prints the tweet, copies the code, and opens Messages.
+It watches `@ChipotleTweets`, looks for promo/code tweets, pulls out the most likely code, makes noise, prints the tweet, copies the code, and opens Messages.
 
-By default it does not send the text. If you want it to send through Messages automatically on macOS, set `AUTO_SEND_MESSAGES=true` in `.env`.
+Auto-send is off by default. If you want the Mac to send the text through Messages, turn on `AUTO_SEND_MESSAGES=true`.
 
-## What it does
+What it can do:
 
-- Watches `@ChipotleTweets`
-- Looks for likely promo/code tweets
-- Tries to extract the best code
-- Avoids obvious junk like URLs, hashtags, usernames, dates, and times
-- Plays a loud alert
-- Prints the tweet and code in the terminal
-- Opens macOS Messages to `888222`
-- Can auto-send through Messages if you turn that on
-- Copies the code to your clipboard
-- Remembers tweets it already checked so it does not keep alerting on the same thing
+- monitor `@ChipotleTweets`
+- use the official X API if you have a token
+- optionally fall back to `ntscraper`/Nitter if you install it
+- rate limit outbound requests
+- detect likely promo tweets
+- extract likely codes
+- avoid repeats with a local seen file
+- copy the code
+- open Messages
+- optionally send through Messages on macOS
 
-## Monitoring backend
-
-Best setup: use the official X API if you have a bearer token.
-
-```env
-MONITOR_BACKEND=auto
-X_BEARER_TOKEN=your_token_here
-```
-
-If you do not set `X_BEARER_TOKEN`, it falls back to [`ntscraper`](https://pypi.org/project/ntscraper/). That works without an API key, but it depends on public Nitter instances, which can be flaky.
-
-You can force either one:
-
-```env
-MONITOR_BACKEND=x_api
-```
-
-or:
-
-```env
-MONITOR_BACKEND=nitter
-```
-
-## Setup
+Setup:
 
 ```bash
 git clone https://github.com/anikethmalipeddi/chipotle-code-hunter.git
@@ -53,82 +30,78 @@ source .venv/bin/activate
 
 pip install -r requirements.txt
 cp .env.example .env
-python3 main.py
 ```
 
-Edit `.env` if you want to change the account, phone number, polling time, alert sound, or anything else.
+Before running it, either add `X_BEARER_TOKEN` to `.env` or install the optional Nitter fallback shown below.
 
-## Usage
-
-Run normally:
+Useful commands:
 
 ```bash
 python3 main.py
-```
-
-Run one check and exit:
-
-```bash
 python3 main.py --once
-```
-
-Test the code detection logic:
-
-```bash
 python3 main.py --test-detection
-```
-
-Show your current config:
-
-```bash
 python3 main.py --show-config
-```
-
-Safe dry run:
-
-```bash
-DRY_RUN=true AUTO_OPEN_MESSAGES=false PLAY_SOUND=false python3 main.py --once
-```
-
-Test the Messages/send path without fetching tweets:
-
-```bash
 DRY_RUN=true AUTO_SEND_MESSAGES=true python3 main.py --test-message DUNK23
 ```
 
-Actually enable auto-send:
+Important `.env` stuff:
+
+```env
+TARGET_USERNAME=ChipotleTweets
+SMS_NUMBER=888222
+
+MONITOR_BACKEND=auto
+X_BEARER_TOKEN=
+REQUEST_MIN_INTERVAL_SECONDS=2
+
+POLL_INTERVAL_SECONDS=30
+FETCH_COUNT=5
+DETECTION_THRESHOLD=6
+
+AUTO_OPEN_MESSAGES=true
+AUTO_SEND_MESSAGES=false
+COPY_CODE_TO_CLIPBOARD=true
+PLAY_SOUND=true
+ALERT_SOUND=/System/Library/Sounds/Sosumi.aiff
+ALERT_REPEAT_COUNT=3
+
+STATE_FILE=.chipotle-code-hunter-seen.json
+LOG_LEVEL=INFO
+DRY_RUN=false
+```
+
+For the most reliable monitoring, use the official X API. Put the real token in your local `.env` file:
+
+```env
+MONITOR_BACKEND=auto
+X_BEARER_TOKEN=
+```
+
+Do not commit your real `.env`. It is ignored by git.
+
+If you do not have X API access, you can use the optional Nitter fallback:
+
+```bash
+python3 -m pip install ntscraper==0.4.0
+```
+
+Then leave `X_BEARER_TOKEN` blank. Public Nitter instances can be unreliable, so X API is still the better setup.
+
+To enable auto-send on macOS:
 
 ```env
 AUTO_SEND_MESSAGES=true
 ```
 
-## Config
+Test it safely first:
 
-These go in `.env`.
+```bash
+DRY_RUN=true AUTO_SEND_MESSAGES=true python3 main.py --test-message DUNK23
+```
 
-| Variable | Default | What it does |
-| --- | --- | --- |
-| `TARGET_USERNAME` | `ChipotleTweets` | Account to watch, without `@`. |
-| `SMS_NUMBER` | `888222` | Text-to-claim number. |
-| `MONITOR_BACKEND` | `auto` | `auto`, `x_api`, or `nitter`. |
-| `X_BEARER_TOKEN` | empty | Official X API bearer token. Used when set. |
-| `POLL_INTERVAL_SECONDS` | `30` | How often to check. |
-| `FETCH_COUNT` | `5` | How many recent tweets to look at. |
-| `DETECTION_THRESHOLD` | `6` | Higher = fewer alerts, lower = more alerts. |
-| `AUTO_OPEN_MESSAGES` | `true` | Opens Messages when a code is found. |
-| `AUTO_SEND_MESSAGES` | `false` | Sends the code through macOS Messages automatically. Requires Messages/SMS forwarding and macOS automation permission. |
-| `COPY_CODE_TO_CLIPBOARD` | `true` | Copies the code after detection. |
-| `PLAY_SOUND` | `true` | Plays the alert sound. |
-| `ALERT_SOUND` | `/System/Library/Sounds/Sosumi.aiff` | Sound file for the alert. |
-| `ALERT_REPEAT_COUNT` | `3` | How many times to play the sound. |
-| `NITTER_INSTANCE` | empty | Optional Nitter instance. |
-| `NTSCRAPER_LOG_LEVEL` | `0` | Log level for `ntscraper`. |
-| `STATE_FILE` | `.chipotle-code-hunter-seen.json` | Local file for already-seen tweets. |
-| `LOG_LEVEL` | `INFO` | App log level. |
-| `MAX_BACKOFF_SECONDS` | `300` | Max retry delay after errors. |
-| `DRY_RUN` | `false` | Disables sounds, clipboard writes, and Messages. |
+Then turn off `DRY_RUN` when you actually want it live. macOS may ask for permission to let Terminal/iTerm/Python control Messages. Your Mac also needs SMS forwarding set up.
 
-## Example output
+Example alert:
 
 ```text
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -142,30 +115,13 @@ Text DUNK23 to 888222 for a free entree while supplies last.
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 ```
 
-## Notes
+Notes:
 
-The official X API is the reliable option if you have access to it. The no-key scraper fallback can break if X changes things or if public Nitter instances are down.
+- `X_BEARER_TOKEN` and `.env` stay local.
+- `--show-config` only says whether the token is configured. It does not print it.
+- Nitter scraping can break.
+- Auto-send is off by default.
+- This is not affiliated with Chipotle or X.
+- You are responsible for following any promo, carrier, Chipotle, and X rules.
 
-Also, the Messages prefill is best-effort. The script opens the `sms:` link and also copies the code because macOS does not always prefill the message body reliably.
-
-If `AUTO_SEND_MESSAGES=true`, the script uses AppleScript to send through the macOS Messages app. You may need to let Terminal/iTerm/Python control Messages in System Settings. Your Mac also has to be able to send SMS messages through Messages.
-
-To test that setup without sending anything, keep `DRY_RUN=true` and run:
-
-```bash
-DRY_RUN=true AUTO_SEND_MESSAGES=true python3 main.py --test-message DUNK23
-```
-
-Once that looks right, set `DRY_RUN=false` in `.env` for the real thing.
-
-## Disclaimer
-
-This is just a personal helper script. You are responsible for following Chipotle, X, carrier, and promo rules.
-
-Automatic sending is off by default. If you enable it, that is on you. This project is not affiliated with Chipotle or X.
-
-## Contributing
-
-PRs are welcome. Useful stuff would be better detection examples, tests, a cleaner tweet source, or an official X API backend.
-
-If this helps you catch a drop, star the repo.
+If this helps you catch a drop, star it.
