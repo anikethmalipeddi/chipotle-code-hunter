@@ -10,7 +10,8 @@ What it can do:
 
 - monitor `@ChipotleTweets`
 - use the official X API if you have a token
-- optionally fall back to `ntscraper`/Nitter if you install it
+- use free Nitter RSS if you do not have a token
+- optionally use `ntscraper` if you install it
 - rate limit outbound requests
 - detect likely promo tweets
 - extract likely codes
@@ -32,7 +33,7 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Before running it, either add `X_BEARER_TOKEN` to `.env` or install the optional Nitter fallback shown below.
+The free default is `MONITOR_BACKEND=auto`, which uses X API if you add a token and otherwise tries Nitter RSS.
 
 Useful commands:
 
@@ -53,6 +54,7 @@ SMS_NUMBER=888222
 MONITOR_BACKEND=auto
 X_BEARER_TOKEN=
 REQUEST_MIN_INTERVAL_SECONDS=2
+NITTER_RSS_BASE_URL=https://nitter.net
 
 POLL_INTERVAL_SECONDS=30
 FETCH_COUNT=5
@@ -79,13 +81,21 @@ X_BEARER_TOKEN=
 
 Do not commit your real `.env`. It is ignored by git.
 
-If you do not have X API access, you can use the optional Nitter fallback:
+If you do not have X API access, leave `X_BEARER_TOKEN` blank. The script will use Nitter RSS for free.
+
+If RSS stops working, you can try the optional `ntscraper` backend:
 
 ```bash
 python3 -m pip install ntscraper==0.4.0
 ```
 
-Then leave `X_BEARER_TOKEN` blank. Public Nitter instances can be unreliable, so X API is still the better setup.
+Then set:
+
+```env
+MONITOR_BACKEND=ntscraper
+```
+
+Public Nitter stuff can be unreliable, so X API is still the most stable setup if you have access.
 
 To enable auto-send on macOS:
 
@@ -119,7 +129,7 @@ Notes:
 
 - `X_BEARER_TOKEN` and `.env` stay local.
 - `--show-config` only says whether the token is configured. It does not print it.
-- Nitter scraping can break.
+- Nitter RSS/scraping can break.
 - Auto-send is off by default.
 - This is not affiliated with Chipotle or X.
 - You are responsible for following any promo, carrier, Chipotle, and X rules.

@@ -18,11 +18,15 @@ import subprocess  # nosec B404
 import sys
 import time
 from dataclasses import dataclass, replace
+from html import unescape
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
+
+from defusedxml import ElementTree
 
 
 LOGGER = logging.getLogger("chipotle_code_hunter")
@@ -122,6 +126,7 @@ class Config:
     play_sound: bool
     alert_sound: str
     alert_repeat_count: int
+    nitter_rss_base_url: str
     nitter_instance: Optional[str]
     ntscraper_log_level: Optional[int]
     state_file: Path
@@ -148,6 +153,7 @@ class Config:
             play_sound=get_bool_env("PLAY_SOUND", True),
             alert_sound=get_env("ALERT_SOUND", "/System/Library/Sounds/Sosumi.aiff"),
             alert_repeat_count=get_int_env("ALERT_REPEAT_COUNT", 3, minimum=1),
+            nitter_rss_base_url=get_env("NITTER_RSS_BASE_URL", "https://nitter.net"),
             nitter_instance=blank_to_none(get_env("NITTER_INSTANCE", "")),
             ntscraper_log_level=get_optional_int_env("NTSCRAPER_LOG_LEVEL", 0),
             state_file=Path(get_env("STATE_FILE", ".chipotle-code-hunter-seen.json")),
@@ -217,6 +223,65 @@ class RateLimiter:
             LOGGER.debug("Rate limiting %s for %.2fs", endpoint_name, wait_for)
             time.sleep(wait_for)
         self._last_request_at = time.monotonic()
+
+
+class HtmlTextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._parts: List[str] = []
+
+    def handle_data(self, data: str) -> None:
+        if data.strip():
+            self._parts.append(data.strip())
+
+    def text(self) -> str:
+        return " ".join(self._parts)
+
+
+class NitterRssTweetSource:
+    """TweetSource backed by a Nitter RSS feed."""
+
+    def __init__(
+        self,
+        base_url: str,
+        rate_limiter: RateLimiter,
+        opener: Optional[Any] = None,
+        timeout_seconds: int = 15,
+    ) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._rate_limiter = rate_limiter
+        self._opener = opener or urlopen
+        self._timeout_seconds = timeout_seconds
+
+    def fetch_latest(self, username: str, count: int) -> List[Tweet]:
+        url = f"{self._base_url}/{username}/rss"
+        request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        self._rate_limiter.wait("nitter_rss")
+
+        try:
+            response = self._opener(request, timeout=self._timeout_seconds)
+            body = response.read()
+        except HTTPError as exc:
+            raise TemporaryFetchError(f"Nitter RSS returned HTTP {exc.code}") from exc
+        except URLError as exc:
+            raise TemporaryFetchError(f"Nitter RSS request failed: {exc}") from exc
+
+        try:
+            root = ElementTree.fromstring(body)
+        except ElementTree.ParseError as exc:
+            raise TemporaryFetchError("Nitter RSS returned invalid XML") from exc
+
+        channel = root.find("channel")
+        if channel is None:
+            raise TemporaryFetchError("Nitter RSS returned no channel")
+
+        tweets: List[Tweet] = []
+        for item in channel.findall("item")[:count]:
+            tweet = parse_rss_item(item, username)
+            if tweet.text:
+                tweets.append(tweet)
+
+        return tweets
 
 
 class NitterTweetSource:
@@ -558,6 +623,39 @@ def parse_nitter_tweet(raw: Dict[str, Any], username: str) -> Tweet:
         created_at=str(raw.get("date") or raw.get("created_at") or "").strip() or None,
         raw=raw,
     )
+
+
+def parse_rss_item(item: Any, username: str) -> Tweet:
+    title = unescape(item.findtext("title") or "").strip()
+    description = html_to_text(item.findtext("description") or "")
+    text = title
+    if description and description not in title:
+        text = f"{title}\n{description}" if title else description
+
+    link = (item.findtext("link") or "").strip()
+    tweet_id = extract_tweet_id(link)
+    url = f"https://x.com/{username}/status/{tweet_id}" if tweet_id else link or None
+
+    raw = {
+        "title": title,
+        "description": description,
+        "link": link,
+        "pubDate": item.findtext("pubDate") or "",
+    }
+    return Tweet(
+        id=tweet_id,
+        text=text.strip(),
+        url=url,
+        created_at=(item.findtext("pubDate") or "").strip() or None,
+        raw=raw,
+    )
+
+
+def html_to_text(value: str) -> str:
+    parser = HtmlTextExtractor()
+    parser.feed(value)
+    parser.close()
+    return unescape(parser.text()).strip()
 
 
 def extract_tweet_id(link: str) -> Optional[str]:
@@ -938,8 +1036,8 @@ def sleep_between_polls(seconds: float) -> bool:
 
 def build_tweet_source(config: Config) -> TweetSource:
     backend = config.monitor_backend
-    if backend not in {"auto", "nitter", "x_api"}:
-        raise RuntimeError("MONITOR_BACKEND must be one of: auto, nitter, x_api")
+    if backend not in {"auto", "nitter_rss", "ntscraper", "nitter", "x_api"}:
+        raise RuntimeError("MONITOR_BACKEND must be one of: auto, x_api, nitter_rss, ntscraper")
 
     rate_limiter = RateLimiter(config.request_min_interval_seconds)
 
@@ -950,7 +1048,11 @@ def build_tweet_source(config: Config) -> TweetSource:
     if backend == "x_api":
         raise RuntimeError("MONITOR_BACKEND=x_api requires X_BEARER_TOKEN")
 
-    LOGGER.info("Using ntscraper/Nitter backend")
+    if backend in {"auto", "nitter_rss"}:
+        LOGGER.info("Using free Nitter RSS backend")
+        return NitterRssTweetSource(config.nitter_rss_base_url, rate_limiter=rate_limiter)
+
+    LOGGER.info("Using ntscraper backend")
     return NitterTweetSource(config.nitter_instance, config.ntscraper_log_level, rate_limiter)
 
 
@@ -1056,6 +1158,7 @@ def print_config(config: Config) -> None:
         "play_sound": config.play_sound,
         "alert_sound": config.alert_sound,
         "alert_repeat_count": config.alert_repeat_count,
+        "nitter_rss_base_url": config.nitter_rss_base_url,
         "nitter_instance": config.nitter_instance,
         "ntscraper_log_level": config.ntscraper_log_level,
         "state_file": str(config.state_file),
